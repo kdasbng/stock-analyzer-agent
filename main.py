@@ -8,7 +8,8 @@ from typing import List
 from google import genai
 
 import config
-from tools import get_stock_price
+from tools import get_stock_price, get_stock_financials, get_stock_historical_performance, get_peer_comparison
+from groq_analyzer import identify_industry_peers, generate_comparison_insights
 
 # Configure logging
 logging.basicConfig(
@@ -195,6 +196,122 @@ Be concise but informative."""
     return "Analysis incomplete."
 
 
+def run_peer_comparison(ticker: str, verbose: bool = False) -> str:
+    """
+    Execute complete peer comparison analysis workflow.
+
+    Args:
+        ticker: Stock ticker to analyze
+        verbose: Enable detailed logging
+
+    Returns:
+        Formatted comparison report string
+    """
+    separator = "\u2500" * 76
+
+    # Step 1: Get base stock financials (for company name, sector, industry)
+    logger.info(f"[Peer Comparison] Fetching base info for {ticker}")
+    base_financials = get_stock_financials(ticker)
+    if "error" in base_financials:
+        return f"\nPeer comparison skipped for {ticker}: {base_financials['error']}"
+
+    company_name = base_financials.get("company_name", ticker)
+    sector = base_financials.get("sector", "Unknown")
+    industry = base_financials.get("industry", "Unknown")
+
+    # Step 2: Identify peers using Groq
+    logger.info(f"[Peer Comparison] Identifying peers for {company_name} ({ticker})")
+    peer_tickers = identify_industry_peers(ticker, company_name, sector, industry)
+    if not peer_tickers:
+        return f"\nPeer comparison skipped for {ticker}: Could not identify industry peers."
+
+    logger.info(f"[Peer Comparison] Peers identified: {peer_tickers}")
+
+    # Step 3: Fetch comparison data
+    comparison = get_peer_comparison(ticker, peer_tickers)
+    base = comparison["base_stock"]
+    peers = comparison["peers"]
+    summary = comparison["comparison_summary"]
+
+    # Step 4: Generate insights using Groq
+    insights = generate_comparison_insights(base, peers)
+
+    # Step 5: Format output
+    def _pct(val):
+        return f"{val:+.2f}%" if val is not None else "N/A"
+
+    def _fmt_cap(val):
+        if val is None:
+            return "N/A"
+        if val >= 1_000_000_000_000:
+            return f"\u20b9{val / 1_000_000_000_000:.2f}T"
+        if val >= 1_000_000_000:
+            return f"\u20b9{val / 1_000_000_000:.2f}B"
+        if val >= 1_000_000:
+            return f"\u20b9{val / 1_000_000:.2f}M"
+        return f"\u20b9{val:,}"
+
+    report_lines = [
+        "",
+        "=" * 80,
+        "PEER COMPARISON ANALYSIS",
+        "=" * 80,
+        "",
+        f"BASE STOCK: {base.get('ticker', ticker)} ({base.get('company_name', 'N/A')})",
+        separator,
+        f"  Current Price : \u20b9{base.get('current_price', 'N/A')}",
+        f"  PE Ratio      : {base.get('pe_ratio_trailing', 'N/A')}",
+        f"  Revenue Growth: {_pct(base.get('revenue_yoy_growth'))}",
+        f"  Profit Margin : {_pct(base.get('profit_margin'))}",
+        f"  Market Cap    : {_fmt_cap(base.get('market_cap'))}",
+        "",
+        "  Performance:",
+        f"    1 Year : {_pct(base.get('return_1y'))}",
+        f"    2 Years: {_pct(base.get('return_2y'))}",
+        f"    3 Years: {_pct(base.get('return_3y'))}",
+        "",
+        "IDENTIFIED PEERS:",
+        separator,
+    ]
+
+    for i, peer in enumerate(peers, 1):
+        if "error" in peer and "ticker" in peer:
+            report_lines.append(f"  {i}. {peer['ticker']} — data unavailable ({peer.get('error', '')})")
+        else:
+            report_lines.extend([
+                f"  {i}. {peer.get('ticker', 'N/A')} ({peer.get('company_name', 'N/A')})",
+                f"     Price: \u20b9{peer.get('current_price', 'N/A')} | "
+                f"PE: {peer.get('pe_ratio_trailing', 'N/A')} | "
+                f"Revenue Growth: {_pct(peer.get('revenue_yoy_growth'))}",
+                f"     Returns: 1Y: {_pct(peer.get('return_1y'))} | "
+                f"2Y: {_pct(peer.get('return_2y'))} | "
+                f"3Y: {_pct(peer.get('return_3y'))}",
+                "",
+            ])
+
+    # Peer averages
+    report_lines.extend([
+        "",
+        "PEER AVERAGES:",
+        separator,
+        f"  Avg PE Ratio      : {summary.get('avg_peer_pe', 'N/A')}",
+        f"  Avg Revenue Growth: {_pct(summary.get('avg_peer_revenue_growth'))}",
+        f"  Avg 1Y Return     : {_pct(summary.get('avg_peer_return_1y'))}",
+    ])
+
+    # Groq insights
+    report_lines.extend([
+        "",
+        "COMPARATIVE INSIGHTS (Groq Analysis):",
+        separator,
+        insights,
+        "",
+        "=" * 80,
+    ])
+
+    return "\n".join(report_lines)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -214,6 +331,11 @@ def main():
         action='store_true',
         help="Show detailed logging including function calls"
     )
+    parser.add_argument(
+        '--compare-peers',
+        action='store_true',
+        help="Enable industry peer comparison analysis (requires GROQ_API_KEY)"
+    )
     
     args = parser.parse_args()
     
@@ -227,6 +349,18 @@ def main():
         
         # Run analysis
         analysis = run_stock_analyzer(tickers, verbose=args.verbose)
+        
+        # Run peer comparison if requested
+        if args.compare_peers:
+            if not config.GROQ_API_KEY:
+                logger.warning("GROQ_API_KEY not configured. Skipping peer comparison.")
+            else:
+                for ticker in tickers:
+                    try:
+                        peer_analysis = run_peer_comparison(ticker, verbose=args.verbose)
+                        analysis += "\n" + peer_analysis
+                    except Exception as e:
+                        logger.error(f"Peer comparison failed for {ticker}: {e}")
         
         # Output results
         if args.output_file:

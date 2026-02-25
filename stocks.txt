@@ -2,4 +2,4 @@
 # Add one ticker per line
 # For Indian stocks, use .NS suffix (NSE) or .BO suffix (BSE)
 
-SPICEJET.NS
+NATIONALUM.NS
