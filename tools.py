@@ -1,10 +1,12 @@
-"""Function tools that Gemini can call."""
+"""Function tools that Gemini can call — now with LangChain @tool wrappers."""
+import json
 import logging
 from typing import Any, Dict, List, Optional
 import yfinance as yf
 from datetime import datetime, timedelta
 import ssl
 import certifi
+from langchain_core.tools import tool
 
 # Disable SSL verification for yfinance (for testing/corporate environments)
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -217,3 +219,32 @@ def _safe_pct(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
     return round(value * 100, 2)
+
+
+# ── LangChain @tool wrappers (Concept 4) ────────────────────────
+# These wrap existing functions so LangChain agents can call them.
+# The docstring becomes the tool description the LLM sees.
+
+@tool
+def get_stock_price_tool(ticker: str) -> str:
+    """Fetch current stock price and basic information for a given ticker symbol.
+    Use this when you need the current price, volume, market cap, or daily change
+    for a stock. Input should be a valid stock ticker like 'NATIONALUM.NS'."""
+    result = get_stock_price(ticker)
+    return json.dumps(result, indent=2, default=str)
+
+
+@tool
+def get_stock_financials_tool(ticker: str) -> str:
+    """Fetch detailed financial metrics (PE ratio, revenue growth, profit margin,
+    sector, industry) for a stock. Input should be a valid ticker symbol."""
+    result = get_stock_financials(ticker)
+    return json.dumps(result, indent=2, default=str)
+
+
+@tool
+def get_stock_historical_performance_tool(ticker: str) -> str:
+    """Calculate historical stock returns over 1, 2, and 3 year periods.
+    Returns percentage returns for each period. Input should be a valid ticker."""
+    result = get_stock_historical_performance(ticker)
+    return json.dumps(result, indent=2, default=str)

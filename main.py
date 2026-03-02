@@ -1,15 +1,28 @@
-"""Stock Price Analyzer Agent - CLI Entry Point."""
+"""Stock Price Analyzer Agent - CLI Entry Point (LangChain edition).
+
+Concept 7: Multi-LLM Orchestration
+  - Gemini agent for base stock analysis (Step 1)
+  - Groq LCEL chains for peer identification & insights (Step 2)
+  - Groq agent for top-peer deep-dive (Step 3)
+  All use the same .invoke() interface thanks to LangChain.
+"""
 import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List
-
-from google import genai
+from typing import Any, Dict, List, Optional
 
 import config
-from tools import get_stock_price, get_stock_financials, get_stock_historical_performance, get_peer_comparison
-from groq_analyzer import identify_industry_peers, generate_comparison_insights
+from tools import get_stock_financials, get_peer_comparison
+from chains import (
+    create_gemini_stock_analyzer,
+    create_peer_identifier_chain,
+    create_comparison_insights_chain,
+    create_groq_stock_analyzer,
+    select_top_peer,
+    parse_peer_tickers,
+    format_comparison_for_prompt,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -17,6 +30,27 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _extract_agent_text(result: dict) -> str:
+    """Extract clean text from a create_agent result.
+
+    The last message's `.content` may be:
+      - a plain str  (Groq)
+      - a list of content blocks like [{'type':'text','text':'...'}, ...] (Gemini)
+    This helper normalises both to a single string.
+    """
+    content = result["messages"][-1].content
+    if isinstance(content, str):
+        return content
+    # list of blocks — keep only text blocks
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block["text"])
+        elif isinstance(block, str):
+            parts.append(block)
+    return "".join(parts)
 
 
 def read_stock_list(file_path: str) -> List[str]:
@@ -80,136 +114,59 @@ def read_stock_list(file_path: str) -> List[str]:
 
 def run_stock_analyzer(tickers: List[str], verbose: bool = False) -> str:
     """
-    Run the stock analyzer using Gemini with function calling.
-    
+    Run the stock analyzer using the Gemini LangChain agent.
+
+    Concept 6: AgentExecutor — replaces the manual function-call loop.
+    The agent autonomously decides which tools to call and when to stop.
+
     Args:
         tickers: List of stock ticker symbols to analyze
         verbose: Whether to show detailed function call logs
-        
+
     Returns:
         Final analysis text from Gemini
     """
-    # Configure Gemini API
-    client = genai.Client(api_key=config.GEMINI_API_KEY)
-    
-    # Model configuration with function calling
-    model_id = config.GEMINI_MODEL
-    
-    # Create initial prompt
+    logger.info(f"Analyzing {len(tickers)} stocks with Gemini LangChain agent...")
+
+    # Concept 1 + 5 + 6: Create the Gemini agent
+    gemini_agent = create_gemini_stock_analyzer()
+
     ticker_list = ", ".join(tickers)
-    initial_prompt = f"""You are a stock market analyst. Analyze these stocks: {ticker_list}
-
-For each stock, fetch the current price data and then provide:
-1. A brief overview of each stock's current performance
-2. Notable movers (biggest gainers or losers)
-3. Any potential concerns or opportunities
-4. Actionable investment insights based on the data
-
-Be concise but informative."""
-    
-    logger.info(f"Analyzing {len(tickers)} stocks with Gemini...")
-    if verbose:
-        logger.info(f"Initial prompt: {initial_prompt}")
-    
-    # Generate content with function calling enabled
-    response = client.models.generate_content(
-        model=model_id,
-        contents=initial_prompt,
-        config=genai.types.GenerateContentConfig(
-            tools=[get_stock_price]
-        )
+    prompt = (
+        f"Analyze these stocks: {ticker_list}\n\n"
+        "For each stock, fetch the current price data and then provide:\n"
+        "1. A brief overview of each stock's current performance\n"
+        "2. Notable movers (biggest gainers or losers)\n"
+        "3. Any potential concerns or opportunities\n"
+        "4. Actionable investment insights based on the data\n\n"
+        "Be concise but informative."
     )
-    
-    # Function calling loop
-    iteration = 0
-    max_iterations = config.MAX_FUNCTION_CALL_ITERATIONS
-    messages = [{'role': 'user', 'parts': [{'text': initial_prompt}]}]
-    
-    while iteration < max_iterations:
-        iteration += 1
-        
-        # Check for function calls in the response
-        if not response.candidates:
-            logger.warning("No response candidates from Gemini")
-            break
-            
-        candidate = response.candidates[0]
-        
-        # Check if we have a final text response
-        if candidate.content.parts and hasattr(candidate.content.parts[0], 'text'):
-            final_text = candidate.content.parts[0].text
-            logger.info("Analysis complete!")
-            return final_text
-        
-        # Check for function calls
-        function_calls = []
-        if candidate.content.parts:
-            for part in candidate.content.parts:
-                if hasattr(part, 'function_call') and part.function_call:
-                    function_calls.append(part)
-        
-        if not function_calls:
-            logger.warning("No function calls or text in response")
-            break
-        
-        # Execute function calls
-        messages.append({'role': 'model', 'parts': candidate.content.parts})
-        function_responses = []
-        
-        for fc_part in function_calls:
-            function_call = fc_part.function_call
-            function_name = function_call.name
-            function_args = dict(function_call.args) if function_call.args else {}
-            
-            if verbose:
-                logger.info(f"Gemini called function: {function_name}({function_args})")
-            
-            # Execute the function
-            if function_name == "get_stock_price":
-                result = get_stock_price(**function_args)
-                
-                if verbose:
-                    logger.info(f"Function result: {result}")
-                
-                function_responses.append({
-                    'function_response': {
-                        'name': function_name,
-                        'response': result
-                    }
-                })
-            else:
-                logger.warning(f"Unknown function called: {function_name}")
-        
-        if not function_responses:
-            break
-        
-        # Send function responses back to Gemini
-        messages.append({'role': 'user', 'parts': function_responses})
-        
-        response = client.models.generate_content(
-            model=model_id,
-            contents=messages,
-            config=genai.types.GenerateContentConfig(
-                tools=[get_stock_price]
-            )
-        )
-    return "Analysis incomplete."
+
+    if verbose:
+        logger.info(f"Prompt: {prompt}")
+
+    # Concept 7: .invoke() — same interface regardless of which LLM is behind it
+    result = gemini_agent.invoke({"messages": [("human", prompt)]})
+    return _extract_agent_text(result)
 
 
 def run_peer_comparison(ticker: str, verbose: bool = False) -> str:
     """
-    Execute complete peer comparison analysis workflow.
+    Execute complete peer comparison + top-peer deep-dive using LangChain chains.
+
+    Concept 3 (LCEL): peer_chain.invoke(), insights_chain.invoke()
+    Concept 7 (Multi-LLM): Groq chains for peers, Groq agent for deep-dive
 
     Args:
         ticker: Stock ticker to analyze
         verbose: Enable detailed logging
 
     Returns:
-        Formatted comparison report string
+        Formatted comparison report string (includes top-peer section)
     """
     separator = "\u2500" * 76
 
-    # Step 1: Get base stock financials (for company name, sector, industry)
+    # ── Step 2a: Get base stock financials ──
     logger.info(f"[Peer Comparison] Fetching base info for {ticker}")
     base_financials = get_stock_financials(ticker)
     if "error" in base_financials:
@@ -219,24 +176,34 @@ def run_peer_comparison(ticker: str, verbose: bool = False) -> str:
     sector = base_financials.get("sector", "Unknown")
     industry = base_financials.get("industry", "Unknown")
 
-    # Step 2: Identify peers using Groq
+    # ── Step 2b: Identify peers via Groq LCEL chain (Concept 3) ──
     logger.info(f"[Peer Comparison] Identifying peers for {company_name} ({ticker})")
-    peer_tickers = identify_industry_peers(ticker, company_name, sector, industry)
+    peer_chain = create_peer_identifier_chain()
+    peer_response = peer_chain.invoke({
+        "ticker": ticker,
+        "company_name": company_name,
+        "sector": sector,
+        "industry": industry,
+    })
+    peer_tickers = parse_peer_tickers(peer_response, exclude_ticker=ticker)
     if not peer_tickers:
         return f"\nPeer comparison skipped for {ticker}: Could not identify industry peers."
 
     logger.info(f"[Peer Comparison] Peers identified: {peer_tickers}")
 
-    # Step 3: Fetch comparison data
+    # ── Step 2c: Fetch comparison data (yfinance — no LLM call) ──
     comparison = get_peer_comparison(ticker, peer_tickers)
     base = comparison["base_stock"]
     peers = comparison["peers"]
     summary = comparison["comparison_summary"]
 
-    # Step 4: Generate insights using Groq
-    insights = generate_comparison_insights(base, peers)
+    # ── Step 2d: Generate insights via Groq LCEL chain (Concept 3) ──
+    insights_chain = create_comparison_insights_chain()
+    insights = insights_chain.invoke({
+        "comparison_data": format_comparison_for_prompt(comparison),
+    })
 
-    # Step 5: Format output
+    # ── Format peer comparison report ──
     def _pct(val):
         return f"{val:+.2f}%" if val is not None else "N/A"
 
@@ -254,7 +221,7 @@ def run_peer_comparison(ticker: str, verbose: bool = False) -> str:
     report_lines = [
         "",
         "=" * 80,
-        "PEER COMPARISON ANALYSIS",
+        "PEER COMPARISON ANALYSIS (Groq via LangChain)",
         "=" * 80,
         "",
         f"BASE STOCK: {base.get('ticker', ticker)} ({base.get('company_name', 'N/A')})",
@@ -276,7 +243,7 @@ def run_peer_comparison(ticker: str, verbose: bool = False) -> str:
 
     for i, peer in enumerate(peers, 1):
         if "error" in peer and "ticker" in peer:
-            report_lines.append(f"  {i}. {peer['ticker']} — data unavailable ({peer.get('error', '')})")
+            report_lines.append(f"  {i}. {peer['ticker']} \u2014 data unavailable ({peer.get('error', '')})")
         else:
             report_lines.extend([
                 f"  {i}. {peer.get('ticker', 'N/A')} ({peer.get('company_name', 'N/A')})",
@@ -302,12 +269,48 @@ def run_peer_comparison(ticker: str, verbose: bool = False) -> str:
     # Groq insights
     report_lines.extend([
         "",
-        "COMPARATIVE INSIGHTS (Groq Analysis):",
+        "COMPARATIVE INSIGHTS (Groq LangChain LCEL Chain):",
         separator,
         insights,
         "",
         "=" * 80,
     ])
+
+    # ── Step 3: Top Peer Deep-Dive (NEW — Groq Agent) ──
+    top_peer = select_top_peer(peers)
+    if top_peer:
+        top_ticker = top_peer.get("ticker", "N/A")
+        logger.info(f"[Top Peer] Running deep-dive analysis for {top_ticker}")
+
+        report_lines.extend([
+            "",
+            "=" * 80,
+            f"TOP PEER DEEP-DIVE: {top_ticker} (Groq Agent via LangChain)",
+            "=" * 80,
+            f"Selected as top peer based on: "
+            f"PE {top_peer.get('pe_ratio_trailing', 'N/A')}, "
+            f"Revenue Growth {_pct(top_peer.get('revenue_yoy_growth'))}, "
+            f"1Y Return {_pct(top_peer.get('return_1y'))}",
+            "",
+        ])
+
+        try:
+            # Concept 5+6: Groq agent with tools for autonomous analysis
+            groq_agent = create_groq_stock_analyzer()
+            peer_result = groq_agent.invoke(
+                {"messages": [("human", f"Perform a detailed stock analysis for: {top_ticker}")]}
+            )
+            report_lines.append(_extract_agent_text(peer_result))
+        except Exception as e:
+            logger.error(f"Groq top-peer deep-dive failed for {top_ticker}: {e}")
+            report_lines.append(f"Top peer deep-dive failed: {e}")
+
+        report_lines.extend(["", "=" * 80])
+    else:
+        report_lines.extend([
+            "",
+            "(Top peer deep-dive skipped — no valid peers with sufficient data)",
+        ])
 
     return "\n".join(report_lines)
 
@@ -369,7 +372,7 @@ def main():
             logger.info(f"Analysis saved to {args.output_file}")
         else:
             print("\n" + "="*80)
-            print("STOCK ANALYSIS")
+            print("STOCK ANALYSIS (Gemini via LangChain)")
             print("="*80)
             print(analysis)
             print("="*80)

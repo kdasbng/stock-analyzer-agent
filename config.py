@@ -36,3 +36,15 @@ MAX_PEERS_TO_ANALYZE = 3
 
 # Comparison Time Periods
 COMPARISON_PERIODS = ['1Y', '2Y', '3Y']
+
+# ── LangChain Settings ──────────────────────────────────────────
+LANGCHAIN_VERBOSE = False  # Set True for debug chain traces
+
+# Gemini via LangChain (Concept 1: ChatModel config)
+GEMINI_MODEL_LANGCHAIN = 'gemini-2.5-flash'
+GEMINI_TEMPERATURE = 0.3
+
+# Groq via LangChain (Concept 1: ChatModel config)
+GROQ_MODEL_LANGCHAIN = 'llama-3.3-70b-versatile'
+GROQ_TEMPERATURE_PEERS = 0.2       # Deterministic for peer identification
+GROQ_TEMPERATURE_ANALYSIS = 0.4    # Slightly creative for narratives
